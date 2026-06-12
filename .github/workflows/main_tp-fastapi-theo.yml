@@ -59,13 +59,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: python-app
-      
-      - name: Login to Azure
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_81148C0A54C840CCAAB650CFF1757838 }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_D5C2D788F08947BAA20311D3D73B1CCE }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_7FD7739707FD4F188C6C1A7A6594C706 }}
 
       - name: 'Deploy to Azure Web App'
         uses: azure/webapps-deploy@v3
@@ -73,4 +66,6 @@ jobs:
         with:
           app-name: 'tp-fastapi-theo'
           slot-name: 'Production'
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          package: .
           
