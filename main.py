@@ -1,7 +1,10 @@
+import hashlib
 import os
 from html import escape
 from pathlib import Path
 
+import psycopg2
+import psycopg2.extras
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -37,7 +40,69 @@ def get_container_client(create_if_missing: bool = False):
     return container_client
 
 
-def upload_to_blob(file: UploadFile) -> dict:
+def get_db_connection():
+    database_url = os.getenv("DATABASE_URL")
+
+    if not database_url:
+        raise HTTPException(
+            status_code=500,
+            detail="La variable DATABASE_URL est manquante.",
+        )
+
+    return psycopg2.connect(database_url)
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def get_user_by_login(login: str):
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                cursor.execute(
+                    "SELECT id, login, mot_de_passe FROM utilisateur WHERE login = %s",
+                    (login,),
+                )
+                return cursor.fetchone()
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur base de données : {error}",
+        )
+
+
+def log_file_action(login: str, action: str, filename: str) -> None:
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id FROM utilisateur WHERE login = %s",
+                    (login,),
+                )
+                user = cursor.fetchone()
+
+                if not user:
+                    return
+
+                cursor.execute(
+                    """
+                    INSERT INTO log_file (id_user, action, lien_blob)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (user[0], action, filename),
+                )
+
+            connection.commit()
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de l'ajout du log : {error}",
+        )
+
+
+def upload_to_blob(file: UploadFile, login: str = "anonymous") -> dict:
     container_client = get_container_client(create_if_missing=True)
 
     if not file.filename:
@@ -47,9 +112,12 @@ def upload_to_blob(file: UploadFile) -> dict:
         blob_client = container_client.get_blob_client(file.filename)
         blob_client.upload_blob(file.file, overwrite=True)
 
+        log_file_action(login, "upload", file.filename)
+
         return {
             "message": "Fichier envoyé avec succès.",
             "filename": file.filename,
+            "user": login,
         }
 
     except Exception as error:
@@ -59,7 +127,7 @@ def upload_to_blob(file: UploadFile) -> dict:
         )
 
 
-def delete_blob(filename: str) -> dict:
+def delete_blob(filename: str, login: str = "anonymous") -> dict:
     container_client = get_container_client()
 
     if not filename:
@@ -69,9 +137,12 @@ def delete_blob(filename: str) -> dict:
         blob_client = container_client.get_blob_client(filename)
         blob_client.delete_blob()
 
+        log_file_action(login, "delete", filename)
+
         return {
             "message": "Fichier supprimé avec succès.",
             "filename": filename,
+            "user": login,
         }
 
     except ResourceNotFoundError:
@@ -104,6 +175,7 @@ def upload_page(status: str = "", filename: str = "") -> str:
                     <span>{safe_file_name}</span>
                     <form method="post" action="/delete" style="display:inline;">
                         <input type="hidden" name="filename" value="{safe_file_name}">
+                        <input type="hidden" name="login" value="anonymous">
                         <button type="submit">Supprimer</button>
                     </form>
                 </li>
@@ -138,6 +210,11 @@ def upload_page(status: str = "", filename: str = "") -> str:
                 margin-bottom: 20px;
             }}
 
+            input {{
+                margin-bottom: 8px;
+                padding: 6px;
+            }}
+
             button {{
                 cursor: pointer;
                 padding: 6px 12px;
@@ -162,9 +239,28 @@ def upload_page(status: str = "", filename: str = "") -> str:
         {message_html}
 
         <div class="card">
+            <h2>Créer un utilisateur</h2>
+            <form method="post" action="/register">
+                <input type="text" name="login" placeholder="Login" required><br>
+                <input type="password" name="password" placeholder="Mot de passe" required><br>
+                <button type="submit">Créer le compte</button>
+            </form>
+        </div>
+
+        <div class="card">
+            <h2>Connexion</h2>
+            <form method="post" action="/login">
+                <input type="text" name="login" placeholder="Login" required><br>
+                <input type="password" name="password" placeholder="Mot de passe" required><br>
+                <button type="submit">Se connecter</button>
+            </form>
+        </div>
+
+        <div class="card">
             <h2>Envoyer un fichier</h2>
             <form method="post" action="/" enctype="multipart/form-data">
-                <input type="file" name="file" required>
+                <input type="text" name="login" placeholder="Login utilisateur" value="anonymous" required><br>
+                <input type="file" name="file" required><br>
                 <button type="submit">Envoyer</button>
             </form>
         </div>
@@ -184,9 +280,80 @@ def upload_page(status: str = "", filename: str = "") -> str:
     """
 
 
+@app.post("/register")
+def register_user(login: str = Form(...), password: str = Form(...)):
+    password_hash = hash_password(password)
+
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO utilisateur (login, mot_de_passe)
+                    VALUES (%s, %s)
+                    """,
+                    (login, password_hash),
+                )
+
+            connection.commit()
+
+        return RedirectResponse(
+            url=f"/?status=Utilisateur créé :&filename={login}",
+            status_code=303,
+        )
+
+    except psycopg2.errors.UniqueViolation:
+        raise HTTPException(status_code=409, detail="Ce login existe déjà.")
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la création de l'utilisateur : {error}",
+        )
+
+
+@app.post("/login")
+def login_user(login: str = Form(...), password: str = Form(...)):
+    user = get_user_by_login(login)
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Identifiants invalides.")
+
+    if user["mot_de_passe"] != hash_password(password):
+        raise HTTPException(status_code=401, detail="Identifiants invalides.")
+
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE utilisateur
+                    SET derniere_connexion = CURRENT_TIMESTAMP
+                    WHERE id = %s
+                    """,
+                    (user["id"],),
+                )
+
+            connection.commit()
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la mise à jour de la connexion : {error}",
+        )
+
+    return {
+        "message": "Connexion réussie.",
+        "user": login,
+    }
+
+
 @app.post("/")
-def upload_from_root(file: UploadFile = File(...)):
-    result = upload_to_blob(file)
+def upload_from_root(
+    file: UploadFile = File(...),
+    login: str = Form("anonymous"),
+):
+    result = upload_to_blob(file, login)
 
     return RedirectResponse(
         url=f"/?status=Fichier envoyé :&filename={result['filename']}",
@@ -212,8 +379,11 @@ def list_files() -> dict:
 
 
 @app.post("/delete")
-def delete_from_root(filename: str = Form(...)):
-    delete_blob(filename)
+def delete_from_root(
+    filename: str = Form(...),
+    login: str = Form("anonymous"),
+):
+    delete_blob(filename, login)
 
     return RedirectResponse(
         url=f"/?status=Fichier supprimé :&filename={filename}",
@@ -222,10 +392,42 @@ def delete_from_root(filename: str = Form(...)):
 
 
 @app.post("/upload")
-def upload_file(file: UploadFile = File(...)) -> dict:
-    return upload_to_blob(file)
+def upload_file(
+    file: UploadFile = File(...),
+    login: str = Form("anonymous"),
+) -> dict:
+    return upload_to_blob(file, login)
 
 
 @app.delete("/remove")
-def remove_file(filename: str) -> dict:
-    return delete_blob(filename)
+def remove_file(filename: str, login: str = "anonymous") -> dict:
+    return delete_blob(filename, login)
+
+
+@app.get("/logs")
+def list_logs() -> dict:
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        log_file.id,
+                        utilisateur.login,
+                        log_file.action,
+                        log_file.lien_blob,
+                        log_file.date
+                    FROM log_file
+                    JOIN utilisateur ON utilisateur.id = log_file.id_user
+                    ORDER BY log_file.date DESC
+                    """
+                )
+                logs = cursor.fetchall()
+
+        return {"logs": logs}
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la récupération des logs : {error}",
+        )
